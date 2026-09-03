@@ -37,16 +37,21 @@ public class FundsQuotaController {
         }
     }
 
-    @GetMapping("/{branchId}/{date}")
-    public ResponseEntity<?> getForBranchAndDate(
+    /**
+     * FIX: endpoint now requires accountId in the path too — GET
+     * /api/funds-quota/{branchId}/{accountId}/{date} — so each cashier only
+     * ever reads back their own starting fund/quota row.
+     */
+    @GetMapping("/{branchId}/{accountId}/{date}")
+    public ResponseEntity<?> getForBranchAndAccountAndDate(
             @PathVariable("branchId") Long branchId,
+            @PathVariable("accountId") String accountId,
             @PathVariable("date") String date) {
         try {
-            return fundsQuotaService.getForBranchAndDate(branchId, date)
+            return fundsQuotaService.getForBranchAndAccountAndDate(branchId, accountId, date)
                     .map(entity -> ResponseEntity.ok(toResponse(entity)))
                     .orElse(ResponseEntity.ok(null));
         } catch (IllegalArgumentException e) {
-            // e.g. malformed date string
             return ResponseEntity.badRequest().body(e.getMessage());
         } catch (Exception e) {
             e.printStackTrace();

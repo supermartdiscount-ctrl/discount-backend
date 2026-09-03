@@ -13,7 +13,7 @@ import java.time.LocalDateTime;
  * "jakarta.persistence.*" import above to "javax.persistence.*".
  */
 @Entity
-@Table(name = "funds_quota", uniqueConstraints = @UniqueConstraint(columnNames = {"branch_id", "duty_date"}))
+@Table(name = "funds_quota", uniqueConstraints = @UniqueConstraint(columnNames = {"branch_id", "account_id", "duty_date"}))
 public class FundsQuota {
 
     @Id
