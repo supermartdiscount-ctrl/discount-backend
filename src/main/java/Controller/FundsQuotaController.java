@@ -38,9 +38,8 @@ public class FundsQuotaController {
     }
 
     /**
-     * FIX: endpoint now requires accountId in the path too — GET
-     * /api/funds-quota/{branchId}/{accountId}/{date} — so each cashier only
-     * ever reads back their own starting fund/quota row.
+     * GET /api/funds-quota/{branchId}/{accountId}/{date} — each cashier
+     * only ever reads back their own starting fund/quota row.
      */
     @GetMapping("/{branchId}/{accountId}/{date}")
     public ResponseEntity<?> getForBranchAndAccountAndDate(

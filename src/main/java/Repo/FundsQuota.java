@@ -5,9 +5,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 
 /**
- * One row per branch, per duty date: the cashier's starting cash fund and
- * that day's sales quota, entered via the "Start of Duty" dialog right
- * after login (Controller.Funds_Quota on the frontend).
+ * One row per branch + account, per duty date: the cashier's starting cash
+ * fund and that day's sales quota, entered via the "Start of Duty" dialog
+ * right after login (Controller.Funds_Quota on the frontend).
  *
  * NOTE: If your project is on Spring Boot 2.x, change the
  * "jakarta.persistence.*" import above to "javax.persistence.*".
