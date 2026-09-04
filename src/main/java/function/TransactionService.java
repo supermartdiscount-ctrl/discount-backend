@@ -46,9 +46,6 @@ public class TransactionService {
         this.monthlySaleRepository = monthlySaleRepository;
     }
 
-    // ... recordTransaction(...), deductStock(...), loadTransactionsForBranchAndDate(...),
-    //     generateTransactionCode(...), randomCodeCandidate() all stay exactly as you have them ...
-
     /**
      * Reads the archived monthly_sales table (NOT the live transactions
      * table) so this reflects only days that have been archived via
@@ -76,7 +73,7 @@ public class TransactionService {
         }
         return results;
     }
-    
+
     /**
      * Archives a branch's sales for one day: aggregates totals + an
      * item-level breakdown from the live transactions/transaction_items
@@ -145,7 +142,7 @@ public class TransactionService {
 
         return saved;
     }
-    
+
     /**
      * Deletes all archived monthly_sales rows for a branch within the
      * given month. This is what backs the "Reset Data" button on the
@@ -166,17 +163,6 @@ public class TransactionService {
         monthlySaleRepository.deleteByBranch_IdAndDayBetween(branchId, start, end);
     }
 
-    /**
-     * Archives a branch's sales for one day: aggregates totals + an
-     * item-level breakdown from the live transactions/transaction_items
-     * rows into monthly_sales, then deletes those live rows. If a
-     * monthly_sales row already exists for this branch/day, it is
-     * overwritten (so re-archiving the same day is safe/idempotent as
-     * long as new transactions came in since the last archive).
-     *
-     * Throws IllegalStateException if the branch doesn't exist or there
-     * is nothing to archive for that day.
-     */
     @Transactional
     public Transaction recordTransaction(TransactionRequest request) {
         if (request.accountId() == null || request.accountId().isBlank()) {
@@ -236,6 +222,44 @@ public class TransactionService {
         transaction.setTransactionCode(generateTransactionCode());
 
         return transactionRepository.save(transaction);
+    }
+
+    /**
+     * Permanently deletes a single, still-live (un-archived) transaction —
+     * backs the ✕ delete button per row in Sales.java. Restores the stock
+     * that was deducted for each of its line items (the mirror image of
+     * deductStock() in recordTransaction()) before removing the row, so
+     * deleting a mistaken sale doesn't leave inventory short.
+     *
+     * If a line item's barcode no longer resolves to a stock Item for that
+     * branch (e.g. the product was deleted from inventory since the sale),
+     * that line's stock restoration is skipped rather than failing the
+     * whole delete — the transaction itself is still removed.
+     *
+     * Deleting the Transaction cascades to its TransactionItem rows
+     * (CascadeType.ALL + orphanRemoval on Transaction#items).
+     *
+     * Throws IllegalStateException if no transaction with that code exists
+     * (e.g. it was already archived/deleted, or the code was mistyped).
+     */
+    @Transactional
+    public void deleteTransaction(String transactionCode) {
+        Transaction txn = transactionRepository.findByTransactionCode(transactionCode)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Transaction not found: " + transactionCode
+                                + " (it may have already been deleted or archived)."));
+
+        Long branchId = txn.getAccount().getBranch().getId();
+        for (TransactionItem line : txn.getItems()) {
+            itemRepo.findByBranch_IdAndBarcode(branchId, line.getBarcode()).ifPresent(stockItem -> {
+                BigDecimal current = stockItem.getQuantity() == null ? BigDecimal.ZERO : stockItem.getQuantity();
+                BigDecimal restored = current.add(BigDecimal.valueOf(line.getQuantity()));
+                stockItem.setQuantity(restored.setScale(2, RoundingMode.HALF_UP));
+                itemRepo.save(stockItem);
+            });
+        }
+
+        transactionRepository.delete(txn);
     }
 
     private void deductStock(Item item, int quantity) {

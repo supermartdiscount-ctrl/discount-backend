@@ -64,6 +64,20 @@ public class TransactionController {
         }
     }
 
+    // DELETE /api/transactions/{transactionCode}
+    // Permanently deletes a single still-live (un-archived) transaction and
+    // restores the stock that was deducted for its line items. Backs the
+    // per-row ✕ delete button in Sales.java's Transactions table.
+    @DeleteMapping("/{transactionCode}")
+    public ResponseEntity<?> deleteTransaction(@PathVariable("transactionCode") String transactionCode) {
+        try {
+            transactionService.deleteTransaction(transactionCode);
+            return ResponseEntity.ok(Map.of("status", "deleted", "transactionCode", transactionCode));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
     // GET /api/transactions/branch/{branchId}/monthly?month=2026-07
     // Returns one entry per day that has transactions, with that day's
     // total sales amount for the given branch. Used by the Monthly report.
