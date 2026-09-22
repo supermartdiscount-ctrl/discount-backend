@@ -2,6 +2,7 @@ package function;
 
 import Repo.AccountRepository;
 import Repo.BranchRepository;
+import Repo.FailedTransactionRepository;
 import Repo.ItemRepo;
 import Repo.MonthlySaleRepository;
 import Repo.TransactionRepository;
@@ -33,25 +34,22 @@ public class TransactionService {
     private final ItemRepo itemRepo;
     private final BranchRepository branchRepository;
     private final MonthlySaleRepository monthlySaleRepository;
+    private final FailedTransactionRepository failedTransactionRepository;
 
     public TransactionService(TransactionRepository transactionRepository,
                                AccountRepository accountRepository,
                                ItemRepo itemRepo,
                                BranchRepository branchRepository,
-                               MonthlySaleRepository monthlySaleRepository) {
+                               MonthlySaleRepository monthlySaleRepository,
+                               FailedTransactionRepository failedTransactionRepository) {
         this.transactionRepository = transactionRepository;
         this.accountRepository = accountRepository;
         this.itemRepo = itemRepo;
         this.branchRepository = branchRepository;
         this.monthlySaleRepository = monthlySaleRepository;
+        this.failedTransactionRepository = failedTransactionRepository;
     }
 
-    /**
-     * Reads the archived monthly_sales table (NOT the live transactions
-     * table) so this reflects only days that have been archived via
-     * archiveAndClearDay(...). Un-archived days for the current month
-     * simply won't appear here yet.
-     */
     public List<Monthly> loadDailyNetSalesForBranchAndMonth(Long branchId, YearMonth yearMonth) {
         LocalDate start = yearMonth.atDay(1);
         LocalDate end = yearMonth.atEndOfMonth();
@@ -74,17 +72,6 @@ public class TransactionService {
         return results;
     }
 
-    /**
-     * Archives a branch's sales for one day: aggregates totals + an
-     * item-level breakdown from the live transactions/transaction_items
-     * rows into monthly_sales, then deletes those live rows. If a
-     * monthly_sales row already exists for this branch/day, it is
-     * overwritten (so re-archiving the same day is safe/idempotent as
-     * long as new transactions came in since the last archive).
-     *
-     * Throws IllegalStateException if the branch doesn't exist or there
-     * is nothing to archive for that day.
-     */
     @Transactional
     public MonthlySale archiveAndClearDay(Long branchId, LocalDate day) {
         Branch branch = branchRepository.findById(branchId)
@@ -97,7 +84,7 @@ public class TransactionService {
         }
 
         double totalSales = 0.0, totalCash = 0.0, totalGCash = 0.0, totalCredit = 0.0;
-        Map<String, double[]> itemAgg = new LinkedHashMap<>(); // itemName -> [quantity, amount]
+        Map<String, double[]> itemAgg = new LinkedHashMap<>();
 
         for (Transaction t : transactions) {
             totalSales += t.getTotalAmount();
@@ -106,7 +93,7 @@ public class TransactionService {
                 case "CASH" -> totalCash += t.getTotalAmount();
                 case "GCASH" -> totalGCash += t.getTotalAmount();
                 case "CREDIT" -> totalCredit += t.getTotalAmount();
-                default -> { /* unknown method, still counted in totalSales */ }
+                default -> { }
             }
             for (TransactionItem item : t.getItems()) {
                 double[] agg = itemAgg.computeIfAbsent(item.getItemName(), k -> new double[2]);
@@ -130,29 +117,14 @@ public class TransactionService {
         summary.setTotalCredit(totalCredit);
         summary.setTransactionCount(transactions.size());
         summary.setItemsBreakdownJson(buildItemsJson(itemAgg));
-        // Category breakdown isn't tracked at the item level yet (TransactionItem
-        // has no category column) — left empty until that's added.
         summary.setCategoryBreakdownJson("{}");
 
         MonthlySale saved = monthlySaleRepository.save(summary);
-
-        // Deleting the Transaction entities cascades to TransactionItem
-        // (CascadeType.ALL + orphanRemoval on Transaction#items).
         transactionRepository.deleteAll(transactions);
 
         return saved;
     }
 
-    /**
-     * Deletes all archived monthly_sales rows for a branch within the
-     * given month. This is what backs the "Reset Data" button on the
-     * Monthly report screen. It only touches the monthly_sales archive —
-     * it has no effect on any live, un-archived transactions for the
-     * current month (those live in the transactions table, not here).
-     *
-     * This is a hard delete with no undo, by design (the UI confirms with
-     * the user before calling it).
-     */
     @Transactional
     public void resetMonthlySales(Long branchId, YearMonth yearMonth) {
         if (!branchRepository.existsById(branchId)) {
@@ -163,85 +135,135 @@ public class TransactionService {
         monthlySaleRepository.deleteByBranch_IdAndDayBetween(branchId, start, end);
     }
 
+    /**
+     * FIX (race condition): item stock is now read+locked via
+     * findByBranch_IdAndBarcodeForUpdate(...) (PESSIMISTIC_WRITE) instead of
+     * the plain finder. Two cashiers checking out the same item at nearly
+     * the same time used to both read the "before" stock, both pass the
+     * check, and one save silently overwrote the other — causing either a
+     * false "Insufficient stock" failure or an actual oversell, with no
+     * trace of why. Now the second concurrent checkout simply WAITS for the
+     * DB row lock to release, then re-reads the already-updated stock, so
+     * it either succeeds correctly or fails for a REAL reason — never a
+     * phantom one caused by the race itself.
+     *
+     * FIX (visibility): any failure here — including ones a retry would fix
+     * on its own — is now persisted to failed_transactions BEFORE the
+     * exception is thrown, so Sales.java's "Failed Transactions" dialog
+     * shows the real reason without needing the cashier to relay it.
+     */
     @Transactional
     public Transaction recordTransaction(TransactionRequest request) {
-        if (request.accountId() == null || request.accountId().isBlank()) {
-            throw new IllegalArgumentException("accountId is required.");
-        }
-        if (request.items() == null || request.items().isEmpty()) {
-            throw new IllegalArgumentException("At least one item is required.");
-        }
-        String method = request.paymentMethod() == null ? "" : request.paymentMethod().toUpperCase();
-        if (!method.equals("CASH") && !method.equals("GCASH") && !method.equals("CREDIT")) {
-            throw new IllegalArgumentException("paymentMethod must be CASH, GCASH, or CREDIT.");
-        }
-        if (method.equals("GCASH") && (request.gcashAccountName() == null || request.gcashAccountName().isBlank())) {
-            throw new IllegalArgumentException("gcashAccountName is required for GCASH payments.");
-        }
+        Long branchIdForLogging = null;
+        String branchNameForLogging = null;
 
-        Account account = accountRepository.findByAccountId(request.accountId())
-                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + request.accountId()));
-        Long branchId = account.getBranch().getId();
-
-        Transaction transaction = new Transaction();
-        transaction.setAccount(account);
-        transaction.setPaymentMethod(method);
-        transaction.setGcashAccountName(method.equals("GCASH") ? request.gcashAccountName() : null);
-
-        double totalAmount = 0.0;
-        for (TransactionItemRequest itemReq : request.items()) {
-            if (itemReq.quantity() <= 0) {
-                throw new IllegalArgumentException("Quantity must be positive for item: " + itemReq.itemName());
+        try {
+            if (request.accountId() == null || request.accountId().isBlank()) {
+                throw new IllegalArgumentException("accountId is required.");
+            }
+            if (request.items() == null || request.items().isEmpty()) {
+                throw new IllegalArgumentException("At least one item is required.");
+            }
+            String method = request.paymentMethod() == null ? "" : request.paymentMethod().toUpperCase();
+            if (!method.equals("CASH") && !method.equals("GCASH") && !method.equals("CREDIT")) {
+                throw new IllegalArgumentException("paymentMethod must be CASH, GCASH, or CREDIT.");
+            }
+            if (method.equals("GCASH") && (request.gcashAccountName() == null || request.gcashAccountName().isBlank())) {
+                throw new IllegalArgumentException("gcashAccountName is required for GCASH payments.");
             }
 
-            Item stockItem = itemRepo.findByBranch_IdAndBarcode(branchId, itemReq.barcode())
-                    .orElseThrow(() -> new IllegalArgumentException(
-                            "Item not found for this branch (barcode " + itemReq.barcode() + ")."));
+            Account account = accountRepository.findByAccountId(request.accountId())
+                    .orElseThrow(() -> new IllegalArgumentException("Account not found: " + request.accountId()));
+            Long branchId = account.getBranch().getId();
+            branchIdForLogging = branchId;
+            branchNameForLogging = account.getBranch().getBranchName();
 
-            deductStock(stockItem, itemReq.quantity());
+            Transaction transaction = new Transaction();
+            transaction.setAccount(account);
+            transaction.setPaymentMethod(method);
+            transaction.setGcashAccountName(method.equals("GCASH") ? request.gcashAccountName() : null);
 
-            TransactionItem line = new TransactionItem(
-                    itemReq.itemName(),
-                    itemReq.unit(),
-                    itemReq.price(),
-                    itemReq.quantity(),
-                    itemReq.barcode()
-            );
-            transaction.addItem(line);
-            totalAmount += line.getSubtotal();
+            BigDecimal totalAmount = BigDecimal.ZERO;
+            for (TransactionItemRequest itemReq : request.items()) {
+                if (itemReq.quantity() <= 0) {
+                    throw new IllegalArgumentException("Quantity must be positive for item: " + itemReq.itemName());
+                }
+
+                // FIX: locked read — blocks concurrent checkouts on the SAME
+                // item row instead of letting them race each other.
+                Item stockItem = itemRepo.findByBranch_IdAndBarcodeForUpdate(branchId, itemReq.barcode())
+                        .orElseThrow(() -> new IllegalArgumentException(
+                                "Item not found for this branch (barcode " + itemReq.barcode() + ")."));
+
+                deductStock(stockItem, itemReq.quantity());
+
+                TransactionItem line = new TransactionItem(
+                        itemReq.itemName(),
+                        itemReq.unit(),
+                        itemReq.price(),
+                        itemReq.quantity(),
+                        itemReq.barcode()
+                );
+                transaction.addItem(line);
+                totalAmount = totalAmount.add(toMoney(line.getSubtotal()));
+            }
+
+            // FIX: BigDecimal comparison — removes float-summation drift
+            // between the client's running total and this independently
+            // recomputed total.
+            BigDecimal tendered = toMoney(request.tenderedAmount());
+            if (tendered.compareTo(totalAmount) < 0) {
+                throw new IllegalArgumentException("Tendered amount is less than the total amount due.");
+            }
+
+            transaction.setTotalAmount(totalAmount.doubleValue());
+            transaction.setTenderedAmount(tendered.doubleValue());
+            transaction.setChangeAmount(tendered.subtract(totalAmount).doubleValue());
+            transaction.setTransactionCode(generateTransactionCode());
+
+            return transactionRepository.save(transaction);
+
+        } catch (IllegalArgumentException | IllegalStateException ex) {
+            logFailedAttempt(request, branchIdForLogging, branchNameForLogging, ex.getMessage());
+            throw ex;
         }
-
-        totalAmount = round2(totalAmount);
-        if (request.tenderedAmount() < totalAmount) {
-            throw new IllegalArgumentException("Tendered amount is less than the total amount due.");
-        }
-
-        transaction.setTotalAmount(totalAmount);
-        transaction.setTenderedAmount(request.tenderedAmount());
-        transaction.setChangeAmount(round2(request.tenderedAmount() - totalAmount));
-        transaction.setTransactionCode(generateTransactionCode());
-
-        return transactionRepository.save(transaction);
     }
 
-    /**
-     * Permanently deletes a single, still-live (un-archived) transaction —
-     * backs the ✕ delete button per row in Sales.java. Restores the stock
-     * that was deducted for each of its line items (the mirror image of
-     * deductStock() in recordTransaction()) before removing the row, so
-     * deleting a mistaken sale doesn't leave inventory short.
-     *
-     * If a line item's barcode no longer resolves to a stock Item for that
-     * branch (e.g. the product was deleted from inventory since the sale),
-     * that line's stock restoration is skipped rather than failing the
-     * whole delete — the transaction itself is still removed.
-     *
-     * Deleting the Transaction cascades to its TransactionItem rows
-     * (CascadeType.ALL + orphanRemoval on Transaction#items).
-     *
-     * Throws IllegalStateException if no transaction with that code exists
-     * (e.g. it was already archived/deleted, or the code was mistyped).
-     */
+    /** Best-effort logging — a failure here must never mask the real error. */
+    private void logFailedAttempt(TransactionRequest request, Long branchId, String branchName, String reason) {
+        try {
+            FailedTransaction failed = new FailedTransaction();
+            failed.setAccountId(request.accountId());
+            failed.setBranchId(branchId);
+            failed.setBranchName(branchName);
+            failed.setPaymentMethod(request.paymentMethod());
+            failed.setTenderedAmount(request.tenderedAmount());
+            failed.setComputedTotal(0.0); // failure may happen before total is known
+            failed.setItemsJson(buildRequestItemsJson(request));
+            failed.setReason(reason == null ? "Unknown error" : reason);
+            failedTransactionRepository.save(failed);
+        } catch (Exception loggingFailure) {
+            System.out.println("[TransactionService] Could not log failed transaction attempt: "
+                    + loggingFailure.getMessage());
+        }
+    }
+
+    private String buildRequestItemsJson(TransactionRequest request) {
+        if (request.items() == null) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (TransactionItemRequest item : request.items()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{\"itemName\":\"").append(escapeJson(item.itemName())).append("\",")
+              .append("\"quantity\":").append(item.quantity()).append(",")
+              .append("\"price\":").append(item.price()).append(",")
+              .append("\"barcode\":\"").append(escapeJson(item.barcode())).append("\"}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     @Transactional
     public void deleteTransaction(String transactionCode) {
         Transaction txn = transactionRepository.findByTransactionCode(transactionCode)
@@ -280,6 +302,14 @@ public class TransactionService {
                 branchId, start, end);
     }
 
+    /** Used by the new "Failed Transactions" endpoint in TransactionController. */
+    public List<FailedTransaction> loadFailedTransactionsForBranchAndDate(Long branchId, LocalDate date) {
+        LocalDateTime start = date.atStartOfDay();
+        LocalDateTime end = date.plusDays(1).atStartOfDay();
+        return failedTransactionRepository.findByBranchIdAndAttemptedAtBetweenOrderByAttemptedAtDesc(
+                branchId, start, end);
+    }
+
     private String generateTransactionCode() {
         String candidate;
         do {
@@ -298,6 +328,10 @@ public class TransactionService {
 
     private double round2(double v) {
         return Math.round(v * 100.0) / 100.0;
+    }
+
+    private BigDecimal toMoney(double v) {
+        return BigDecimal.valueOf(v).setScale(2, RoundingMode.HALF_UP);
     }
 
     private String buildItemsJson(Map<String, double[]> itemAgg) {

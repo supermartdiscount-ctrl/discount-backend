@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import function.MonthlySale;
 import Response.ArchiveResponse;
+import Response.FailedTransactionResponse;
 
 @RestController
 @RequestMapping("/api/transactions")
@@ -126,6 +127,26 @@ public class TransactionController {
             return ResponseEntity.ok(ArchiveResponse.from(saved));
         } catch (IllegalArgumentException | IllegalStateException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid date format. Use yyyy-MM-dd."));
+        }
+    }
+    
+    // GET /api/transactions/failed/branch/{branchId}?date=2026-09-22
+    // Backs Sales.java's "Failed Transactions" dialog — shows checkout
+    // attempts that did NOT get saved, with the real server-side reason.
+    @GetMapping("/failed/branch/{branchId}")
+    public ResponseEntity<?> getFailedTransactionsForBranch(
+            @PathVariable("branchId") Long branchId,
+            @RequestParam("date") String date) {
+        try {
+            LocalDate parsedDate = LocalDate.parse(date);
+            List<FailedTransactionResponse> results = transactionService
+                    .loadFailedTransactionsForBranchAndDate(branchId, parsedDate)
+                    .stream()
+                    .map(FailedTransactionResponse::from)
+                    .toList();
+            return ResponseEntity.ok(results);
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("error", "Invalid date format. Use yyyy-MM-dd."));
         }
