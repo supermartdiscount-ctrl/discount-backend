@@ -8,6 +8,7 @@ import Repo.MonthlySaleRepository;
 import Repo.TransactionRepository;
 import Request.TransactionItemRequest;
 import Request.TransactionRequest;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @Service
 public class TransactionService {
@@ -151,9 +153,31 @@ public class TransactionService {
      * on its own — is now persisted to failed_transactions BEFORE the
      * exception is thrown, so Sales.java's "Failed Transactions" dialog
      * shows the real reason without needing the cashier to relay it.
+     *
+     * NEW (idempotency): if request.idempotencyKey() matches an already-
+     * saved transaction, that SAME transaction is returned immediately —
+     * no stock is deducted and no new row is inserted. This makes it safe
+     * for the client to retry a checkout it's not sure went through (e.g.
+     * after a network timeout or an app crash before the response arrived)
+     * using the same key: the retry either creates the transaction for the
+     * first time, or discovers it already exists and just returns it.
+     *
+     * A DataIntegrityViolationException on save (unique constraint on
+     * idempotency_key) means two near-simultaneous requests with the same
+     * key both passed the findByIdempotencyKey check before either
+     * committed — the loser of that race simply looks the winner's row up
+     * and returns it instead of failing.
      */
     @Transactional
     public Transaction recordTransaction(TransactionRequest request) {
+        // Idempotent replay check — must happen before ANY stock mutation.
+        if (request.idempotencyKey() != null && !request.idempotencyKey().isBlank()) {
+            Optional<Transaction> existing = transactionRepository.findByIdempotencyKey(request.idempotencyKey());
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+        }
+
         Long branchIdForLogging = null;
         String branchNameForLogging = null;
 
@@ -182,6 +206,9 @@ public class TransactionService {
             transaction.setAccount(account);
             transaction.setPaymentMethod(method);
             transaction.setGcashAccountName(method.equals("GCASH") ? request.gcashAccountName() : null);
+            transaction.setIdempotencyKey(
+                    request.idempotencyKey() == null || request.idempotencyKey().isBlank()
+                            ? null : request.idempotencyKey());
 
             BigDecimal totalAmount = BigDecimal.ZERO;
             for (TransactionItemRequest itemReq : request.items()) {
@@ -221,7 +248,21 @@ public class TransactionService {
             transaction.setChangeAmount(tendered.subtract(totalAmount).doubleValue());
             transaction.setTransactionCode(generateTransactionCode());
 
-            return transactionRepository.save(transaction);
+            try {
+                return transactionRepository.save(transaction);
+            } catch (DataIntegrityViolationException dup) {
+                // Concurrent retry race on the same idempotencyKey — the
+                // other request won, so just return its saved row instead
+                // of failing (and instead of deducting stock twice, since
+                // this save never committed).
+                if (request.idempotencyKey() != null && !request.idempotencyKey().isBlank()) {
+                    Optional<Transaction> winner = transactionRepository.findByIdempotencyKey(request.idempotencyKey());
+                    if (winner.isPresent()) {
+                        return winner.get();
+                    }
+                }
+                throw dup;
+            }
 
         } catch (IllegalArgumentException | IllegalStateException ex) {
             logFailedAttempt(request, branchIdForLogging, branchNameForLogging, ex.getMessage());

@@ -20,6 +20,15 @@ import java.util.List;
  * A single completed sale (one checkout in Home.java's cart). Always tied to
  * the Account that processed it, which in turn is tied to a Branch - so a
  * transaction's branch is reached via transaction.getAccount().getBranch().
+ *
+ * NEW: idempotencyKey — a UUID generated client-side ONCE per checkout
+ * attempt (see Home.java's completeSale()). If the client never receives a
+ * confirmed response (timeout, dropped connection, app crash) it retries
+ * the SAME checkout using the SAME key. TransactionService.recordTransaction()
+ * checks this key before doing any stock deduction / insert, so a retried
+ * attempt can never create a duplicate transaction or double-deduct stock —
+ * it just returns the already-saved result. Nullable/unique so old rows
+ * (saved before this field existed) are unaffected.
  */
 @Entity
 @Table(name = "transactions")
@@ -53,6 +62,10 @@ public class Transaction {
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
+
+    // NEW — see class-level javadoc above.
+    @Column(name = "idempotency_key", unique = true, length = 64)
+    private String idempotencyKey;
 
     @OneToMany(mappedBy = "transaction", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     private List<TransactionItem> items = new ArrayList<>();
@@ -92,6 +105,9 @@ public class Transaction {
 
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+
+    public String getIdempotencyKey() { return idempotencyKey; }
+    public void setIdempotencyKey(String idempotencyKey) { this.idempotencyKey = idempotencyKey; }
 
     public List<TransactionItem> getItems() { return items; }
     public void setItems(List<TransactionItem> items) { this.items = items; }

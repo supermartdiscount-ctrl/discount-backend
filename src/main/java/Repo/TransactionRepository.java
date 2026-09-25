@@ -19,6 +19,11 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
     List<Transaction> findByAccount_Branch_IdAndCreatedAtBetweenOrderByCreatedAtAsc(
             Long branchId, LocalDateTime start, LocalDateTime end);
 
+    // NEW — backs the idempotent-replay check in
+    // TransactionService.recordTransaction(): if a checkout attempt with
+    // this exact key was already saved (e.g. the client retried after a
+    // timeout), we return that existing row instead of saving/deducting
+    // stock again.
+    Optional<Transaction> findByIdempotencyKey(String idempotencyKey);
 
-    
 }
